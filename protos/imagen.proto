@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package protocolBuffers;
+
+// Definir enum para los tipos de codificación
+enum EncodingType {
+    NONE = 0;
+    JPEG = 1;
+    LZ4 = 2;
+    PNG = 3;
+}
+
+message VideoFrame {
+    bytes frame_data = 1;          // Datos del frame comprimido
+    int32 width = 2;               // Ancho del frame
+    int32 height = 3;              // Alto del frame
+    int32 channels = 4;            // Número de canales
+    EncodingType encoding = 5;     // Tipo de codificación (enum)
+    int64 frame_number = 6;        // Número de frame
+    double timestamp = 7;          // Timestamp en segundos
+    int32 compression_quality = 8; // Calidad de compresión (1-100)
+    bool is_keyframe = 9;          // Si es frame clave
+}
