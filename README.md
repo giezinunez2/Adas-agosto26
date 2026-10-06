@@ -27,6 +27,24 @@ El sistema se dividió en módulos independientes y desacoplados:
 - Inclusión de un `.gitignore` estricto para ignorar el entorno virtual (`venv/`), temporales de Python (`__pycache__/`) y pesos de modelos (`*.pt`, `*.onnx`), reduciendo el peso del repositorio de 2.9 GB a menos de 20 MB.
 
 ---
+## 🚀 Modo de Uso / Ejecución
+
+Instrucciones para iniciar los nodos emisores (*publishers*) y receptores (*subscribers*) del sistema.
+
+### 1. Nodos Emisores (Publishers)
+
+Ejecuta cada flujo de cámara en una terminal independiente especificando el ID de la transmisión y el índice del dispositivo de video:
+
+```bash
+# Emisor 1: Cámara frontal (Terminal 1)
+python main_pub.py --stream-id 1 --camera 0 --adas
+
+# Emisor 2: Cámara trasera (Terminal 2)
+python main_pub.py --stream-id 2 --camera 2 --adas
+
+# Cámaras 3 y 4 (Terminales 3 y 4)
+python main_pub.py --stream-id 3 --camera 3 --adas
+python main_pub.py --stream-id 4 --camera 4 --adas
 
 ## 📂 Estructura del Proyecto
 
