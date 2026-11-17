@@ -1,0 +1,16 @@
+.git
+.gitignore
+.vscode
+.idea
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+.env
+*.log
+runs/
+logs/

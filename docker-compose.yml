@@ -1,0 +1,71 @@
+name: adas
+
+x-base: &base
+  build:
+    context: .
+  network_mode: host
+  ipc: host
+  init: true
+  environment:
+    DISPLAY: ${DISPLAY:-:0}
+    QT_X11_NO_MITSHM: "1"
+    PYTHONUNBUFFERED: "1"
+
+services:
+  # ───────────── LAPTOP (desarrollo, hot-reload) ─────────────
+  adas_dev_dashboard:
+    <<: *base
+    image: adas:dev
+    profiles: ["dev"]
+    volumes:
+      - .:/app
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    command: ["watchmedo", "auto-restart", "--directory=/app", "--patterns=*.py",
+              "--recursive", "--", "python3", "main_sub_ai.py", "--streams", "1"]
+
+  adas_dev_pub:
+    <<: *base
+    image: adas:dev
+    profiles: ["dev"]
+    volumes:
+      - .:/app
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    devices:
+      - /dev/video0:/dev/video0
+    command: ["watchmedo", "auto-restart", "--directory=/app", "--patterns=*.py",
+              "--recursive", "--", "python3", "main_pub.py",
+              "--stream-id", "1", "--camera", "0", "--no-adas"]
+
+  # ───────────── RASPBERRY PI 5 + Hailo-8L ─────────────
+  adas_pi5_hailo:
+    <<: *base
+    image: adas:pi5
+    profiles: ["pi5"]
+    restart: unless-stopped
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/hailo0:/dev/hailo0
+    command: ["python3", "main_pub.py", "--stream-id", "1", "--camera", "0", "--adas"]
+
+  adas_pi5_receiver:
+    <<: *base
+    image: adas:pi5
+    profiles: ["pi5-standalone"]
+    restart: unless-stopped
+    devices:
+      - /dev/hailo0:/dev/hailo0
+    command: ["python3", "main_sub_ai.py", "--streams", "1"]
+
+  # ───────────── RASPBERRY PI 4 (sin IA local) ─────────────
+  adas_pi4_pub:
+    <<: *base
+    image: adas:pi4
+    profiles: ["pi4"]
+    restart: unless-stopped
+    build:
+      context: .
+      args:
+        WITH_TORCH: "0"
+    devices:
+      - /dev/video0:/dev/video0
+    command: ["python3", "main_pub.py", "--stream-id", "2", "--camera", "0", "--no-adas"]
