@@ -1,3 +1,7 @@
+import os
+import sys
+import time
+
 import cv2
 from utils.helper_functions import get_optimal_backend
 from user_interface.text_labels_overlay import draw_overlay
@@ -30,12 +34,25 @@ Attributes:
     yolo_processor: Instance of YOLOProcessor if enabled
 """
 class CameraManager:
+    # Reintentos al perder un stream de red (HTTP/RTSP) antes de rendirse
+    STREAM_RECONNECT_ATTEMPTS = 10
+    STREAM_RECONNECT_DELAY_S = 1.0
+
+    # Caché de gui_available(): None = aún no comprobado
+    _gui_available = None
+
     """Initialize the basic camera parameters"""
-    def __init__(self, camera_index: int, width: int, height: int, fps: int, enable_yolo: bool,
+    def __init__(self, camera_index: int | str, width: int, height: int, fps: int, enable_yolo: bool,
                  yolo_mode: str, yolo_interval: int, yolo_conf: float):
 
+        # camera_index: int = cámara local; str = URL de red (http://, https://, rtsp://)
+        self.is_stream = isinstance(camera_index, str)
+
         # Parameter validation
-        if camera_index < 0:
+        if self.is_stream:
+            if not camera_index.strip():
+                raise ValueError("camera_index (URL) cannot be empty")
+        elif camera_index < 0:
             raise ValueError(f"camera_index cannot be negative: {camera_index}")
         if width <= 0 or height <= 0:
             raise ValueError(f"Invalid dimensions:{width}x{height}")
@@ -83,6 +100,18 @@ class CameraManager:
         based on the operating system
     """
     def __enter__(self):
+        if self.is_stream:
+            # Stream de red: la resolución y los FPS los define el servidor;
+            # cap.set() no tiene efecto sobre HTTP/RTSP, así que no se aplica.
+            self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_FFMPEG)
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Error: Could not open stream {self.camera_index}")
+            w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"🌐 Network stream opened: {self.camera_index} ({w}x{h}); "
+                  f"width/height/fps arguments are ignored for this source")
+            return self
+
         backend = get_optimal_backend()
         self.cap = cv2.VideoCapture(self.camera_index, backend)
 
@@ -96,6 +125,27 @@ class CameraManager:
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         return self
+
+    """
+    Tries to reopen a network stream that stopped delivering frames.
+
+    Returns:
+        tuple: (ret, frame) of the first successful read, or (False, None)
+    """
+    def _reconnect_stream(self):
+        for attempt in range(1, self.STREAM_RECONNECT_ATTEMPTS + 1):
+            print(f"⚠️ Stream lost, reconnecting "
+                  f"({attempt}/{self.STREAM_RECONNECT_ATTEMPTS})...")
+            if self.cap is not None:
+                self.cap.release()
+            time.sleep(self.STREAM_RECONNECT_DELAY_S)
+            self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_FFMPEG)
+            if self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if ret:
+                    print("✅ Stream recovered")
+                    return ret, frame
+        return False, None
 
     """
     Captures a single frame from the camera.
@@ -113,6 +163,8 @@ class CameraManager:
     """
     def read_frame(self):
         ret, frame = self.cap.read()
+        if not ret and self.is_stream:
+            ret, frame = self._reconnect_stream()
         if not ret:
             raise RuntimeError("Error reading frame from camera")
         # Process with YOLO if enabled
@@ -134,9 +186,50 @@ class CameraManager:
         - Stores window names for automatic cleanup
     """
     def create_preview_window(self, window_name: str, width: int, height: int):
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, width, height)
+        if not self.gui_available():
+            return
+        try:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, width, height)
+        except cv2.error as e:
+            self._disable_gui(e)
+            return
         self.preview_windows.append(window_name)
+
+    """
+    Checks (once) whether OpenCV can open windows in this environment.
+
+    Returns False for opencv-python-headless builds (GUI: NONE) and for Linux
+    sessions without DISPLAY/WAYLAND_DISPLAY. It cannot detect an unreachable
+    X server: in that case Qt aborts the process on the first window.
+    """
+    @classmethod
+    def gui_available(cls) -> bool:
+        if cls._gui_available is not None:
+            return cls._gui_available
+
+        ok = True
+        try:
+            for line in cv2.getBuildInformation().splitlines():
+                if line.strip().startswith("GUI:"):
+                    ok = line.split(":", 1)[1].strip().upper() not in ("", "NONE")
+                    break
+        except Exception:
+            pass  # si no se puede leer el build info, se asume que hay GUI
+
+        if ok and sys.platform.startswith("linux") and not (
+                os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            ok = False
+
+        cls._gui_available = ok
+        return ok
+
+    @classmethod
+    def _disable_gui(cls, error=None):
+        if cls._gui_available is not False:
+            print(f"⚠️ OpenCV GUI not available, running without preview windows"
+                  f"{f': {error}' if error else ''}")
+        cls._gui_available = False
 
     """
     Prepare a preview frame with a metrics overlay.
@@ -192,8 +285,11 @@ class CameraManager:
     - Optimized for real-time updates
     """
     def show_preview(self, window_name: str, frame):
-        if not self._windows_closed:
-            cv2.imshow(window_name, frame)
+        if not self._windows_closed and self.gui_available():
+            try:
+                cv2.imshow(window_name, frame)
+            except cv2.error as e:
+                self._disable_gui(e)
 
     """
     Wait for a key press.
@@ -211,7 +307,14 @@ class CameraManager:
     """
     @staticmethod
     def wait_key(delay: int = 1):
-        return cv2.waitKey(delay) & 0xFF
+        # Sin GUI (headless) cv2.waitKey lanza cv2.error: se devuelve "ninguna tecla" (255)
+        if not CameraManager.gui_available():
+            return 0xFF
+        try:
+            return cv2.waitKey(delay) & 0xFF
+        except cv2.error as e:
+            CameraManager._disable_gui(e)
+            return 0xFF
 
     """
     Closes all preview windows safely.
@@ -221,6 +324,9 @@ class CameraManager:
     """
     def close_preview_windows(self):
         if self._windows_closed:
+            return
+        if not self.gui_available():
+            self._windows_closed = True
             return
 
         try:

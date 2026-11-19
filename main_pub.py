@@ -38,6 +38,11 @@ def main():
     # Create topic name
     topic_name = f"{args.topic_prefix}_{args.stream_id}"
 
+    # Sin GUI de OpenCV (p. ej. opencv-python-headless o sin DISPLAY) no hay preview
+    if not args.no_preview and not CameraManager.gui_available():
+        print("ℹ️ OpenCV GUI no disponible en este entorno: se activa --no-preview")
+        args.no_preview = True
+
     # ADAS: solo tiene sentido con preview local y es excluyente con el YOLO legacy
     use_adas = bool(args.adas)
     if use_adas and args.no_preview:

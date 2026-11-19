@@ -29,11 +29,20 @@ def height_type(value: str | int) -> int:
 def fps_type(value: str | int) -> int:
     return validate_range(value, 1, 50, "Fps")
 
-def camera_type(value: str) -> int:
+# Fuentes de red aceptadas por --camera (además del índice entero de siempre)
+CAMERA_URL_PREFIXES = ("http://", "https://", "rtsp://")
+
+def camera_type(value: str) -> int | str:
+    # URL de red (p. ej. MJPEG servido desde Windows): se devuelve tal cual, sin sondear
+    if value.lower().startswith(CAMERA_URL_PREFIXES):
+        return value
+
+    # Índice de cámara local: comportamiento original, sin cambios
     ivalue = int(value)
     if not validate_camera(ivalue):
         raise argparse.ArgumentTypeError(f"Camera {ivalue} not available\n"
-                                         f"Try with:  --camera 0, --camera 1 or --camera 2")
+                                         f"Try with:  --camera 0, --camera 1 or --camera 2 "
+                                         f"(or a URL: http://host:port/video)")
     return ivalue
 
 # -------------------------------------------------------------------------------
@@ -79,7 +88,7 @@ def parse_arguments():
     parser.add_argument('--quality', '-q', type=quality_type, default=quality,
                         help='Compression quality (1-100) for JPEG')
     parser.add_argument('--camera', '-c', type=camera_type, default=pub_sub_conf.CAMERA_INDEX,
-                        help='Camera index')
+                        help='Camera index (0, 1, 2...) or network stream URL (http://, https://, rtsp://)')
     parser.add_argument('--width', type=int, default=width,
                         help='Frame width')
     parser.add_argument('--height', type=int, default=height,

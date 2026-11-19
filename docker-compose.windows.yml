@@ -1,0 +1,49 @@
+﻿name: adas
+
+# Antes de levantar los contenedores, en Windows:
+#   E:\venv_adas\Scripts\python.exe mjpeg_server.py --camera 0 --port 18080
+
+x-base: &base
+  build:
+    context: .
+  network_mode: host
+  ipc: host
+  init: true
+
+x-env: &env
+  DISPLAY: 127.0.0.1:0.0
+  QT_X11_NO_MITSHM: "1"
+  PYTHONUNBUFFERED: "1"
+  CAMERA_URL: ${CAMERA_URL:-http://127.0.0.1:18080/video}
+  OPENCV_FFMPEG_CAPTURE_OPTIONS: "fflags;nobuffer|flags;low_delay"
+
+x-dev: &dev
+  <<: *base
+  image: adas:dev
+  profiles: ["dev"]
+  environment: *env
+  volumes:
+    - .:/app
+
+services:
+  adas_dev_dashboard:
+    <<: *dev
+    command:
+      - sh
+      - -c
+      - |
+        sed -i 's/^network_enabled *= *.*/network_enabled = false/; s/^use_shm *= *.*/use_shm = 1/; s/^use_tcp *= *.*/use_tcp = 0/' /etc/ecal/ecal.ini
+        exec watchmedo auto-restart --no-restart-on-command-exit --directory=/app --patterns='*.py' --recursive -- python3 main_sub_ai.py --streams 1
+
+  adas_dev_pub:
+    <<: *dev
+    command:
+      - sh
+      - -c
+      - |
+        sed -i 's/^network_enabled *= *.*/network_enabled = false/; s/^use_shm *= *.*/use_shm = 1/; s/^use_tcp *= *.*/use_tcp = 0/' /etc/ecal/ecal.ini
+        until python3 -c "import os,urllib.request as u; u.urlopen(os.environ['CAMERA_URL'].rsplit('/',1)[0] + '/health', timeout=2)" >/dev/null 2>&1; do
+          echo "Esperando al servidor MJPEG en Windows ($$CAMERA_URL)..."
+          sleep 2
+        done
+        exec watchmedo auto-restart --no-restart-on-command-exit --directory=/app --patterns='*.py' --recursive -- python3 main_pub.py --stream-id 1 --camera "$$CAMERA_URL" --width 1280 --height 720 --fps 30 --no-adas --no-preview
