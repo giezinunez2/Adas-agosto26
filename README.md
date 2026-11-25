@@ -10,5 +10,5 @@
 - xhost +local:root
 - docker compose --profile pi5-standalone up -d --build
 
-cd ~/Adas-agosto26
+- cd ~/Adas-agosto26
 ./iniciar_camaras.sh
