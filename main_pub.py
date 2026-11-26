@@ -6,11 +6,22 @@ Handles camera initialization, stream management, and real-time video publishing
 with optional YOLO processing, optional BYD ADAS local preview and local preview.
 
 Pipeline (hilo principal):  capturar -> (submit a hilo IA) -> serializar+publicar -> preview
-Pipeline (hilo IA):         último frame -> YOLOv8n -> distancias -> resultados compartidos
+Pipeline (hilo IA):         último frame -> YOLOv8n-seg (Hailo o CPU) -> distancias -> resultados
 
-IMPORTANTE: el frame publicado por eCAL es siempre el frame LIMPIO de la cámara.
-Los cuboides 3D solo se dibujan en una copia para el preview local; el receptor AI
-hace su propia inferencia sobre el frame limpio.
+Modos de publicación:
+    * Video crudo (por defecto):  frame LIMPIO codificado (JPEG/LZ4/PNG...). El receptor
+      hace su propia inferencia (Prueba A - centralizado).
+    * --edge-ai:                  además de enviar video, este nodo infiere y adjunta las
+      detecciones (caja + polígono + distancias) en el Protobuf.
+    * --edge-ai --no-video:       Edge Offloading (Prueba B): solo se publica el Protobuf
+      ligero (is_metadata_only=True, frame_data=b"").
+
+Ejemplo (ADASCore, Raspberry Pi 5 + AI HAT):
+    python3 main_pub.py --stream-id 1 --camera 0 --edge-ai --no-video \
+        --backend hailo --model models/yolov8n_seg.hef --no-preview
+
+Los cuboides/máscaras solo se dibujan en una copia para el preview local; lo que viaja por
+eCAL nunca lleva dibujos encima.
 
 Keyboard Controls:
     - 'q': Quit application
@@ -46,6 +57,13 @@ def main():
     if use_adas and args.enable_yolo:
         print("⚠️ --adas y --enable-yolo son excluyentes: se usa ADAS y se desactiva el YOLO legacy")
 
+    # Edge AI: inferencia en este nodo (no depende del preview) y detecciones en el Protobuf
+    use_edge = bool(args.edge_ai)
+    if use_edge and args.enable_yolo:
+        print("⚠️ --edge-ai y --enable-yolo son excluyentes: se usa Edge AI y se desactiva el YOLO legacy")
+    need_detector = use_adas or use_edge
+    backend = args.backend or ("hailo" if use_edge else "cpu")
+
     # Display startup banner with configuration
     print("=" * 50)
     print(f"📡 Topic: {topic_name}")
@@ -56,9 +74,13 @@ def main():
     print(f"📏 Resolution: {args.width}x{args.height}")
     print(f"🎞️ FPS: {args.fps}")
     print(f"🔑 Keyframe every: {args.keyframe_interval} frames")
-    if use_adas:
-        print(f"🚗 BYD ADAS: ENABLED (conf={args.adas_conf}, imgsz={args.adas_imgsz})")
-    elif args.enable_yolo:
+    if use_edge:
+        print(f"🧠 EDGE AI: ENABLED (backend={backend}, modelo={args.model or 'por defecto'}, "
+              f"conf={args.adas_conf})")
+        print(f"📦 Publicación: {'SOLO METADATOS (sin video)' if args.no_video else 'video + detecciones'}")
+    elif use_adas:
+        print(f"🚗 BYD ADAS: ENABLED (backend={backend}, conf={args.adas_conf}, imgsz={args.adas_imgsz})")
+    if not (use_edge or use_adas) and args.enable_yolo:
         print(f"🎯 YOLO: ENABLED")
         print(f"   Mode: {args.yolo_mode}")
         print(f"   Confidence: {args.yolo_conf}")
@@ -73,8 +95,9 @@ def main():
 
     try:
         # Hilo de inferencia asíncrona (no participa en la captura ni en la publicación)
-        if use_adas:
-            detector = AsyncADASDetector(imgsz=args.adas_imgsz, conf=args.adas_conf)
+        if need_detector:
+            detector = AsyncADASDetector(model_path=args.model, imgsz=args.adas_imgsz,
+                                         conf=args.adas_conf, backend=backend)
             detector.start()
 
         # Initialize camera with context manager for automatic cleanup
@@ -82,7 +105,7 @@ def main():
                             args.width,
                             args.height,
                             args.fps,
-                            enable_yolo=args.enable_yolo and not use_adas,
+                            enable_yolo=args.enable_yolo and not need_detector,
                             yolo_mode=args.yolo_mode,
                             yolo_interval=args.yolo_interval,
                             yolo_conf=args.yolo_conf)
@@ -113,13 +136,26 @@ def main():
                     if detector is not None:
                         detector.submit(args.stream_id, frame)
 
-                    # 3. Serializar y publicar el frame limpio
+                    # 3. Serializar y publicar (video limpio, video + detecciones, o solo metadatos)
+                    edge_dets, edge_ms, edge_fps = None, 0.0, 0.0
+                    if use_edge:
+                        edge_dets, edge_age = detector.get(args.stream_id)
+                        if edge_age > ADAS_MAX_DETECTION_AGE_S:
+                            edge_dets = []
+                        edge_ms = detector.inference_ms
+                        # ai_fps > 0 marca al nodo como Edge AI desde el primer mensaje
+                        edge_fps = max(detector.ai_fps, 0.01)
+
                     result = stream_manager.process_frame(
                         frame=frame,
                         encoding=args.encoding,
                         quality=args.quality,
                         keyframe_interval=args.keyframe_interval,
-                        publisher=pub
+                        publisher=pub,
+                        detections=edge_dets,
+                        inference_ms=edge_ms,
+                        ai_fps=edge_fps,
+                        metadata_only=bool(args.no_video)
                     )
 
                     if result['success']:
@@ -152,10 +188,15 @@ def main():
                         if stream_manager.should_print_stats():
                             stats = stream_manager.get_stats()
                             size_mb = result['metrics']['size'] / (1024 * 1024)
+                            edge_info = ""
+                            if use_edge:
+                                edge_info = (f" | IA: {detector.ai_fps:.1f} fps, "
+                                             f"inf {detector.inference_ms:.1f} ms, "
+                                             f"obj {len(edge_dets or [])}")
                             print(f"📊 Cam{args.stream_id} | Frame {result['frame_number']:04d} | "
                                 f"FPS: {stats['avg_fps']:.1f} | "
-                                f"Size: {size_mb:.3f} MB | "
-                                f"Latency: {result['latency'] * 1000:.1f}ms")
+                                f"Size: {size_mb * 1024:.1f} KB | "
+                                f"Latency: {result['latency'] * 1000:.1f}ms{edge_info}")
                 else:
                     time.sleep(0.03)
 
@@ -168,10 +209,10 @@ def main():
                     paused = not paused
                     status = "PAUSED" if paused else "RESUMED"
                     print(f"⏸️ {status}")
-                elif key == ord('t') and args.enable_yolo and not use_adas and args.yolo_mode == 'segmentation':
+                elif key == ord('t') and args.enable_yolo and not need_detector and args.yolo_mode == 'segmentation':
                     # Change transparency in segmentation
                     cam.yolo_processor.set_transparency(cam.yolo_processor.transparency + 0.1)
-                elif key == ord('c') and args.enable_yolo and not use_adas:
+                elif key == ord('c') and args.enable_yolo and not need_detector:
                     # Change trust
                     new_conf = cam.yolo_processor.confidence + 0.1
                     if new_conf > 0.9:

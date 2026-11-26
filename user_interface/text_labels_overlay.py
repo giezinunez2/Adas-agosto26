@@ -11,6 +11,9 @@ ENCODING_COLORS = {
     3: (255, 100, 255)   # PNG - Magenta
 }
 
+# Color (BGR) del indicador para mensajes is_metadata_only (sin video / frame_data vacío)
+META_COLOR = (255, 255, 0)  # Cyan
+
 # --- Metrics configuration per role ---
 METRICS_CONFIG = {
     'publisher': ['fps', 'latency', 'size_mb', 'encoding', 'quality'],
@@ -141,7 +144,7 @@ Color Coding:
     - FPS: Green (>30), Yellow (20-30), Red (<20)
     - Latency: Green (<100ms), Yellow (100-500ms), Red (>500ms)
     - Lost: Green (<10%), Light Blue (10-50%), Blue (>50%)
-    - Encoding: Light Cyan
+    - Encoding: Light Cyan  (is_metadata_only -> 'META' in Cyan, Quality omitted)
     - Quality: Orange
 """
 def get_display_metrics(role: str, msg, fps: float, latency: float, lost: float = 0, size_mb: float = None):
@@ -167,8 +170,12 @@ def get_display_metrics(role: str, msg, fps: float, latency: float, lost: float 
             metrics.append(('LOST', f"{lost:.1f}%", lost_color))
 
     # Commons
-    metrics.append(('ENC', get_encoding_name(getattr(msg, 'encoding', 1)), (200, 200, 255)))
-    metrics.append(('QUAL', getattr(msg, 'compression_quality', 0), (255, 200, 100)))
+    if getattr(msg, 'is_metadata_only', False):
+        # Sin video (frame_data vacío): encoding/calidad no aplican y serían engañosos
+        metrics.append(('ENC', 'META', META_COLOR))
+    else:
+        metrics.append(('ENC', get_encoding_name(getattr(msg, 'encoding', 1)), (200, 200, 255)))
+        metrics.append(('QUAL', getattr(msg, 'compression_quality', 0), (255, 200, 100)))
 
     return metrics
 
@@ -339,7 +346,10 @@ def draw_optimized_overlay(frame: np.ndarray, msg, fps: float, latency: float, l
                     font, font_small, (255, 255, 255), thickness + 1)
 
     # --- Status bar (top border) ---
-    encoding_color = get_encoding_color(getattr(msg, 'encoding', 1))
+    if getattr(msg, 'is_metadata_only', False):
+        encoding_color = META_COLOR
+    else:
+        encoding_color = get_encoding_color(getattr(msg, 'encoding', 1))
     cv2.rectangle(display_frame, (0, 0), (width, 2), encoding_color, -1)
 
     return display_frame

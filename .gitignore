@@ -5,3 +5,6 @@ __pycache__/
 *.engine
 .idea/
 .vscode/
+hailo_pkg/
+models/*.pt
+models/*.hef

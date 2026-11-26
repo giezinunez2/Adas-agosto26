@@ -10,8 +10,30 @@ enum EncodingType {
     PNG = 3;
 }
 
+// Vértice de un polígono de segmentación (píxeles del frame original de la cámara)
+message Point2D {
+    int32 x = 1;
+    int32 y = 2;
+}
+
+// Objeto detectado por un nodo Edge AI (caja + máscara poligonal + geometría ADAS)
+message DetectedObject {
+    int32 x1 = 1;
+    int32 y1 = 2;
+    int32 x2 = 3;
+    int32 y2 = 4;
+    int32 cls_id = 5;
+    string label = 6;
+    float conf = 7;
+    float z_m = 8;               // Distancia sobre el eje óptico
+    float lateral_m = 9;         // Desplazamiento lateral (+ = derecha de la imagen)
+    float dist_m = 10;           // Distancia total al parachoques
+    float real_width_m = 11;     // Ancho físico asumido para la clase
+    repeated Point2D polygon = 12;
+}
+
 message VideoFrame {
-    bytes frame_data = 1;          // Datos del frame comprimido
+    bytes frame_data = 1;          // Datos del frame comprimido (vacío si is_metadata_only)
     int32 width = 2;               // Ancho del frame
     int32 height = 3;              // Alto del frame
     int32 channels = 4;            // Número de canales
@@ -20,4 +42,10 @@ message VideoFrame {
     double timestamp = 7;          // Timestamp en segundos
     int32 compression_quality = 8; // Calidad de compresión (1-100)
     bool is_keyframe = 9;          // Si es frame clave
+
+    // --- Edge AI offloading ---
+    bool is_metadata_only = 10;    // True: solo metadatos (frame_data vacío)
+    float inference_ms = 11;       // Latencia de inferencia en el nodo Edge
+    float ai_fps = 12;             // Ciclos de inferencia por segundo del nodo Edge
+    repeated DetectedObject objects = 13;
 }

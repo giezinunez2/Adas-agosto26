@@ -111,5 +111,23 @@ def parse_arguments():
     parser.add_argument('--adas-conf', type=float, default=pub_sub_conf.ADAS_CONFIDENCE,
                         help='ADAS detection confidence threshold (0.0 to 1.0)')
     parser.add_argument('--adas-imgsz', type=int, default=pub_sub_conf.ADAS_IMGSZ,
-                        help='ADAS YOLO inference size (e.g. 320, 416, 640)')
-    return parser.parse_args()
+                        help='ADAS YOLO inference size (e.g. 320, 416, 640). El backend hailo usa 640 fijo')
+
+    # --- Edge AI offloading (nodo periférico con AI HAT / Hailo-8L) ---
+    parser.add_argument('--edge-ai', action='store_true',
+                        help='Infiere en ESTE nodo (yolov8n-seg) y publica las detecciones '
+                             '(caja + polígono + distancias) dentro del Protobuf')
+    parser.add_argument('--no-video', action='store_true',
+                        help='Con --edge-ai: no codifica ni envía video; publica solo metadatos '
+                             '(is_metadata_only=True, frame_data vacío)')
+    parser.add_argument('--backend', type=str, choices=['hailo', 'cpu'], default=None,
+                        help='Backend de inferencia: hailo (/dev/hailo0, HEF) o cpu (ultralytics). '
+                             'Por defecto: hailo con --edge-ai, cpu con --adas')
+    parser.add_argument('--model', type=str, default=None,
+                        help='Ruta del modelo: .hef para hailo (def. models/yolov8n_seg.hef) '
+                             'o .pt para cpu (def. yolov8n-seg.pt)')
+
+    args = parser.parse_args()
+    if args.no_video and not args.edge_ai:
+        parser.error("--no-video requiere --edge-ai (sin IA en el nodo no habría nada que publicar)")
+    return args

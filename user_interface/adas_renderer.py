@@ -1,15 +1,18 @@
 """
-Renderizado ADAS: cuboides 3D, overlay por cámara, grilla métrica tipo ajedrez (BEV),
+Renderizado ADAS: máscaras de segmentación poligonales, cuboides 3D, overlay por cámara,
+canvas HUD para nodos Edge que solo envían metadatos, grilla métrica tipo ajedrez (BEV),
 helpers de celdas y banner de alerta crítica.
 """
 
+import math
 import time
 from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
-from img_processing.adas_geometry import Detection, format_distance, severity_color
+from img_processing.adas_geometry import (Detection, format_distance, scaled_focal_length,
+                                          severity_color)
 from utils import pub_sub_conf as cfg
 
 
@@ -44,9 +47,32 @@ def draw_3d_cuboid(img, x1, y1, x2, y2, color=(0, 255, 0), scale=0.20, label="")
                     (255, 255, 255), 1, cv2.LINE_AA)
 
 
+def draw_segmentation_masks(frame: np.ndarray, detections: Sequence[Detection],
+                            alpha: float = 0.40, outline: int = 2) -> np.ndarray:
+    """
+    Máscaras poligonales semitransparentes coloreadas por severidad (+ contorno).
+    Se rellenan todos los polígonos sobre una sola copia y se mezcla una única vez.
+    Modifica `frame` in situ. Las detecciones sin polígono se ignoran.
+    """
+    polys = [(det, np.asarray(det.polygon, dtype=np.int32).reshape(-1, 1, 2))
+             for det in detections if det.polygon and len(det.polygon) >= 3]
+    if not polys:
+        return frame
+
+    overlay = frame.copy()
+    for det, pts in polys:
+        cv2.fillPoly(overlay, [pts], severity_color(det.dist_m))
+    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, dst=frame)
+    for det, pts in polys:
+        cv2.polylines(frame, [pts], True, severity_color(det.dist_m), outline, cv2.LINE_AA)
+    return frame
+
+
 def draw_detection_overlay(frame: np.ndarray, detections: Sequence[Detection],
                            ai_fps: Optional[float] = None) -> np.ndarray:
-    """Dibuja cuboides coloreados por severidad con 'Clase: +x.xxm'. Modifica `frame` in situ."""
+    """Máscaras de segmentación + cuboides coloreados por severidad con 'Clase: +x.xxm'. Modifica `frame` in situ."""
+    draw_segmentation_masks(frame, detections)
+
     for det in detections:
         color = severity_color(det.dist_m)
         label = f"{det.label}: {format_distance(det.dist_m)}"
@@ -56,6 +82,57 @@ def draw_detection_overlay(frame: np.ndarray, detections: Sequence[Detection],
         cv2.putText(frame, f"ADAS IA: {ai_fps:.1f} fps", (10, frame.shape[0] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
     return frame
+
+
+def make_edge_telemetry_canvas(src_w: int, src_h: int, detections: Sequence[Detection],
+                               ai_fps: Optional[float] = None,
+                               inference_ms: Optional[float] = None) -> np.ndarray:
+    """
+    Canvas HUD calibrado para un nodo Edge que envía SOLO metadatos (sin video crudo).
+
+    Tiene el tamaño del frame original de la cámara (src_w x src_h) para que los polígonos y
+    cajas recibidos se dibujen en sus coordenadas reales. Incluye:
+      - rejilla del plano imagen cada src_w/8 px y cruz del eje óptico,
+      - regla angular calibrada con la focal de la cámara (x = cx + f * tan(theta)),
+      - máscaras poligonales, cuboides 3D y distancias (mismo estilo que con video).
+    El llamador lo ajusta a la celda con fit_to_cell().
+    """
+    src_w, src_h = max(64, int(src_w)), max(64, int(src_h))
+    canvas = np.empty((src_h, src_w, 3), dtype=np.uint8)
+    canvas[:] = (24, 28, 38)
+
+    step = max(20, src_w // 8)
+    for x in range(0, src_w, step):
+        cv2.line(canvas, (x, 0), (x, src_h), (40, 46, 60), 1)
+    for y in range(0, src_h, step):
+        cv2.line(canvas, (0, y), (src_w, y), (40, 46, 60), 1)
+
+    cx, cy = src_w // 2, src_h // 2
+    cv2.line(canvas, (cx, 0), (cx, src_h), (0, 140, 255), 1, cv2.LINE_AA)
+    cv2.line(canvas, (0, cy), (src_w, cy), (0, 140, 255), 1, cv2.LINE_AA)
+
+    focal = scaled_focal_length(src_w)
+    hfov = 2.0 * math.degrees(math.atan(src_w / (2.0 * focal)))
+    for deg in range(-80, 81, 10):
+        x = int(round(cx + focal * math.tan(math.radians(deg))))
+        if 0 <= x < src_w:
+            cv2.line(canvas, (x, src_h - 14), (x, src_h), (170, 170, 170), 1)
+            cv2.putText(canvas, f"{deg:+d}", (x - 12, src_h - 18), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.35, (170, 170, 170), 1, cv2.LINE_AA)
+
+    draw_detection_overlay(canvas, detections)
+
+    cv2.putText(canvas, f"EDGE AI - SOLO METADATOS | {src_w}x{src_h} | HFOV {hfov:.0f} deg",
+                (8, src_h - 36), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+    parts = []
+    if ai_fps is not None:
+        parts.append(f"IA {ai_fps:.1f} fps")
+    if inference_ms is not None:
+        parts.append(f"inf {inference_ms:.1f} ms")
+    if parts:
+        cv2.putText(canvas, " | ".join(parts), (8, 18), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (0, 255, 0), 1, cv2.LINE_AA)
+    return canvas
 
 
 def fit_to_cell(frame: np.ndarray, cell_w: int, cell_h: int) -> np.ndarray:

@@ -3,6 +3,12 @@ Gestor de suscripciones multi-canal para el receptor AI.
 
 Mantiene el último mensaje de cada stream (webcam_stream_1..4), métricas de recepción
 (FPS, latencia, frames perdidos) y decodifica bajo demanda solo cuando hay un frame nuevo.
+
+Recepción HÍBRIDA por stream:
+    - Nodo Edge AI con video       -> frame + detecciones (msg.objects) ya calculadas.
+    - Nodo Edge AI sin video       -> solo metadatos (is_metadata_only=True): frame None + detecciones.
+    - Nodo sin AI HAT (video crudo)-> frame sin detecciones; el receptor puede inferir en local
+                                      (--backend cpu|hailo) o mostrarlo sin IA (--backend none).
 """
 
 import threading
@@ -12,7 +18,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from interfaces.middleware_factory import create_subscriber
-from img_processing.video_serializer import proto_to_frame
+from img_processing.adas_geometry import Detection
+from img_processing.video_serializer import proto_to_detections, proto_to_frame
 from utils import pub_sub_conf
 
 
@@ -51,11 +58,13 @@ class AIStreamManagerSub:
     def _new_state() -> dict:
         now = time.time()
         return {
-            'msg': None, 'frame': None,
+            'msg': None, 'frame': None, 'dets': [], 'dec_meta': False,
             'decoded_number': -1, 'served_number': -1, 'frame_number': -1,
             'last_rx': 0.0, 'received': 0, 'lost': 0, 'last_number': -1,
             'win_start': now, 'win_frames': 0, 'fps': 0.0,
             'latency': 0.0, 'encoding': 1, 'quality': 0,
+            'metadata_only': False, 'edge_ai': False,
+            'inference_ms': 0.0, 'ai_fps': 0.0, 'width': 0, 'height': 0,
         }
 
     def topic_for(self, stream_id: int) -> str:
@@ -93,6 +102,11 @@ class AIStreamManagerSub:
             st['latency'] = max(0.0, now - getattr(msg, 'timestamp', now))
             st['encoding'] = getattr(msg, 'encoding', 1)
             st['quality'] = getattr(msg, 'compression_quality', 0)
+            st['metadata_only'], st['edge_ai'] = self._edge_flags(msg)
+            st['inference_ms'] = getattr(msg, 'inference_ms', 0.0)
+            st['ai_fps'] = getattr(msg, 'ai_fps', 0.0)
+            st['width'] = getattr(msg, 'width', 0)
+            st['height'] = getattr(msg, 'height', 0)
 
             elapsed = now - st['win_start']
             if elapsed >= 2.0:
@@ -100,11 +114,26 @@ class AIStreamManagerSub:
                 st['win_frames'] = 0
                 st['win_start'] = now
 
+    @staticmethod
+    def _edge_flags(msg) -> Tuple[bool, bool]:
+        """(metadata_only, edge_ai). edge_ai = el nodo emisor corre la inferencia (Hailo)."""
+        metadata_only = bool(getattr(msg, 'is_metadata_only', False))
+        edge_ai = (metadata_only
+                   or getattr(msg, 'ai_fps', 0.0) > 0.0
+                   or getattr(msg, 'inference_ms', 0.0) > 0.0
+                   or len(getattr(msg, 'objects', ())) > 0)
+        return metadata_only, edge_ai
+
     # ------------------------------------------------------------------ lectura
-    def get_frame(self, stream_id: int) -> Tuple[Optional[np.ndarray], dict]:
+    def get_stream(self, stream_id: int) -> Tuple[Optional[np.ndarray], List[Detection], dict]:
         """
-        Devuelve (frame_BGR | None, info). Decodifica solo si hay un frame_number nuevo.
-        info['new'] es True la primera vez que se entrega cada frame.
+        Devuelve (frame_BGR | None, detecciones_remotas, info).
+
+        - frame es None si el nodo envía solo metadatos (o aún no llegó nada decodificable).
+        - detecciones_remotas viene del Protobuf (vacía para streams sin IA en el emisor);
+          info['edge_ai'] indica si esa lista es confiable aunque esté vacía.
+        - Decodifica solo si hay un frame_number nuevo. info['new'] es True la primera vez
+          que se entrega cada mensaje.
         """
         with self._lock:
             st = self._states[stream_id]
@@ -113,24 +142,41 @@ class AIStreamManagerSub:
             need_decode = msg is not None and number != st['decoded_number']
 
         if need_decode:
-            frame = proto_to_frame(msg)          # fuera del lock: es la parte costosa
+            metadata_only, edge_ai = self._edge_flags(msg)
+            frame = None if metadata_only else proto_to_frame(msg)   # fuera del lock: es lo costoso
+            dets = proto_to_detections(msg) if edge_ai else []
             with self._lock:
-                if frame is not None:
+                if metadata_only:
+                    st['frame'] = None
+                elif frame is not None:
                     st['frame'] = frame
+                st['dets'] = dets
+                st['dec_meta'] = metadata_only
                 st['decoded_number'] = number    # evita reintentar un frame corrupto en bucle
 
         with self._lock:
             frame = st['frame']
-            is_new = frame is not None and st['decoded_number'] != st['served_number']
+            has_content = frame is not None or (st['dec_meta'] and st['decoded_number'] >= 0)
+            is_new = has_content and st['decoded_number'] != st['served_number']
             st['served_number'] = st['decoded_number']
             now = time.time()
-            active = frame is not None and (now - st['last_rx']) < pub_sub_conf.ADAS_STREAM_TIMEOUT_S
+            age = now - st['last_rx'] if st['last_rx'] > 0 else float('inf')
+            active = has_content and age < pub_sub_conf.ADAS_STREAM_TIMEOUT_S
+            dets = list(st['dets'])
             info = {
-                'active': active, 'new': is_new,
+                'active': active, 'new': is_new, 'age': age,
                 'fps': st['fps'], 'latency': st['latency'], 'lost': st['lost'],
                 'encoding': st['encoding'], 'quality': st['quality'],
                 'frame_number': st['decoded_number'], 'received': st['received'],
+                'metadata_only': st['metadata_only'], 'edge_ai': st['edge_ai'],
+                'inference_ms': st['inference_ms'], 'ai_fps': st['ai_fps'],
+                'width': st['width'], 'height': st['height'],
             }
+        return frame, dets, info
+
+    def get_frame(self, stream_id: int) -> Tuple[Optional[np.ndarray], dict]:
+        """Compatibilidad con el API anterior: (frame_BGR | None, info)."""
+        frame, _, info = self.get_stream(stream_id)
         return frame, info
 
     # ------------------------------------------------------------------ utilidades
@@ -139,8 +185,13 @@ class AIStreamManagerSub:
         with self._lock:
             for sid in self.stream_ids:
                 st = self._states[sid]
-                print(f"   CAM {sid} ({self.topic_for(sid)}): recibidos={st['received']} "
-                      f"perdidos={st['lost']} fps={st['fps']:.1f} lat={st['latency'] * 1000:.0f}ms")
+                mode = ("EDGE-META" if st['metadata_only'] else
+                        "EDGE+VIDEO" if st['edge_ai'] else "VIDEO-CRUDO")
+                edge = (f" | IA nodo {st['ai_fps']:.1f} fps, inf {st['inference_ms']:.1f} ms"
+                        if st['edge_ai'] else "")
+                print(f"   CAM {sid} ({self.topic_for(sid)}) [{mode}]: recibidos={st['received']} "
+                      f"perdidos={st['lost']} fps={st['fps']:.1f} "
+                      f"lat={st['latency'] * 1000:.0f}ms{edge}")
 
     def stop(self):
         for sid, sub in self._subs.items():

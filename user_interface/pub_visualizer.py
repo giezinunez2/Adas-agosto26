@@ -1,7 +1,10 @@
 import cv2
+import numpy as np
 from utils.helper_functions import get_optimal_backend
 from user_interface.text_labels_overlay import draw_overlay
-from img_processing.yolo_processor import YOLOProcessor
+# NOTA: YOLOProcessor se importa de forma DIFERIDA en CameraManager.__init__ (solo si enable_yolo=True).
+# Un import a nivel de módulo rompería main_pub.py en la imagen ligera adas:pi5 (sin PyTorch/ultralytics),
+# incluso con --edge-ai / --no-video, que nunca usan el YOLO legacy.
 
 """
 Camera manager for real-time video capture and display.
@@ -58,8 +61,8 @@ class CameraManager:
 
         # Initialize YOLO if enabled
         self.enable_yolo = enable_yolo
-        self.enable_yolo = enable_yolo
         if enable_yolo:
+            from img_processing.yolo_processor import YOLOProcessor   # import diferido (ver nota arriba)
             self.yolo_processor = YOLOProcessor(
                 mode=yolo_mode,
                 processing_interval=yolo_interval,
@@ -142,8 +145,11 @@ class CameraManager:
     Prepare a preview frame with a metrics overlay.
     
     Args:
-        frame: High-resolution original frame
-        msg: Protobuf message with metadata
+        frame: High-resolution original frame. May be None / empty (e.g. when the
+               message is metadata-only and there is no video to show); in that case
+               a placeholder canvas is generated instead of crashing in cv2.resize.
+        msg: Protobuf message with metadata (may have is_metadata_only=True and an
+             empty frame_data)
         fps: Current frames per second
         latency: Latency in seconds
         lost: Percentage of lost frames
@@ -160,25 +166,88 @@ class CameraManager:
         - Resizes while maintaining aspect ratio
         - Applies overlay with draw_overlay()
         - Maintains visual quality during resizing
+        - Never raises because of an empty frame or a metadata-only message
+        - A failure while drawing the overlay degrades to the plain preview (warns once)
+          instead of aborting the publisher loop
     """
     @staticmethod
     def prepare_preview_frame(frame, msg, fps: float, latency: float, lost: int,
                               size_mb: float, target_width: int, target_height: int,
                               role: str, camera_label: str):
-        # Resize for preview
-        preview_frame = cv2.resize(frame, (target_width, target_height))
+        target_width = max(1, int(target_width))
+        target_height = max(1, int(target_height))
+        metadata_only = bool(getattr(msg, 'is_metadata_only', False))
+
+        if isinstance(frame, np.ndarray) and frame.size > 0:
+            # Resize for preview (normalizing gray/BGRA frames to 3-channel BGR)
+            preview_frame = cv2.resize(CameraManager._to_bgr(frame), (target_width, target_height))
+        else:
+            # Metadata-only (frame_data empty) or frame not available: nothing to resize
+            preview_frame = CameraManager._placeholder_frame(target_width, target_height, metadata_only)
 
         # Apply metrics overlay
-        display_frame = draw_overlay(
-            preview_frame, msg,
-            fps=fps,
-            latency=latency,
-            lost=lost,
-            size_mb=size_mb,
-            role=role,
-            camera_label=camera_label
-        )
+        try:
+            display_frame = draw_overlay(
+                preview_frame, msg,
+                fps=fps,
+                latency=latency,
+                lost=lost,
+                size_mb=size_mb,
+                role=role,
+                camera_label=camera_label
+            )
+        except Exception as e:  # noqa: BLE001 - the preview must never stop the stream
+            if not CameraManager._overlay_warned:
+                CameraManager._overlay_warned = True
+                print(f"⚠️ Preview overlay disabled for this frame ({type(e).__name__}: {e})")
+            display_frame = preview_frame
         return display_frame
+
+    # One-time warning flag for overlay failures (see prepare_preview_frame)
+    _overlay_warned = False
+
+    """
+    Normalize any OpenCV image to 3-channel BGR uint8.
+    
+    Args:
+        frame: Gray (H, W), (H, W, 1), BGR (H, W, 3) or BGRA (H, W, 4) image
+    
+    Returns:
+        np.ndarray: BGR image (the same object if it already was BGR uint8)
+    """
+    @staticmethod
+    def _to_bgr(frame):
+        if frame.ndim == 2:
+            return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        if frame.ndim == 3 and frame.shape[2] == 1:
+            return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        if frame.ndim == 3 and frame.shape[2] == 4:
+            return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        return frame
+
+    """
+    Build a placeholder canvas for previews without video.
+    
+    Args:
+        width: Canvas width in pixels
+        height: Canvas height in pixels
+        metadata_only: True if the message was published with is_metadata_only=True
+    
+    Returns:
+        np.ndarray: Dark BGR canvas with an explanatory text
+    """
+    @staticmethod
+    def _placeholder_frame(width: int, height: int, metadata_only: bool):
+        canvas = np.empty((height, width, 3), dtype=np.uint8)
+        canvas[:] = (33, 24, 20)
+        title = "SOLO METADATOS" if metadata_only else "SIN VIDEO"
+        subtitle = "(is_metadata_only: sin frame_data)" if metadata_only else "(frame no disponible)"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        for text, scale, color, dy in ((title, 0.9, (255, 255, 0), 0), (subtitle, 0.5, (200, 200, 200), 32)):
+            (tw, th), _ = cv2.getTextSize(text, font, scale, 2)
+            org = (max(0, (width - tw) // 2), height // 2 + dy)
+            cv2.putText(canvas, text, org, font, scale, color, 2, cv2.LINE_AA)
+        return canvas
 
     """
     Displays a frame in the specified preview window.

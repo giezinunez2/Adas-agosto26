@@ -43,6 +43,10 @@ class StreamManagerPub:
         quality: Compression quality (0-100) 
         keyframe_interval: Keyframe interval 
         publisher: Publisher instance (eCAL/RabbitMQ) 
+        detections: (Edge AI) detecciones a adjuntar en msg.objects (None = ninguna)
+        inference_ms: (Edge AI) latencia de inferencia del nodo, en ms
+        ai_fps: (Edge AI) ciclos de inferencia por segundo del nodo
+        metadata_only: True = no se codifica ni envía video (frame_data vacío)
 
     Returns: 
         Dict with processing results: 
@@ -56,12 +60,15 @@ class StreamManagerPub:
     Raises: 
         Exception: If there is an error in serialization or publication 
     """
-    def process_frame(self, frame, encoding, quality, keyframe_interval, publisher):
+    def process_frame(self, frame, encoding, quality, keyframe_interval, publisher,
+                      detections=None, inference_ms=0.0, ai_fps=0.0, metadata_only=False):
         frame_start_time = time.time()
 
         try:
-            # Convert to protobuf
-            msg = frame_to_proto(frame, self.frame_number, keyframe_interval, encoding, quality)
+            # Convert to protobuf (con video, o solo metadatos si metadata_only)
+            msg = frame_to_proto(frame, self.frame_number, keyframe_interval, encoding, quality,
+                                 detections=detections, inference_ms=inference_ms,
+                                 ai_fps=ai_fps, metadata_only=metadata_only)
 
             # Send message and get metrics
             metrics = publisher.send(msg)

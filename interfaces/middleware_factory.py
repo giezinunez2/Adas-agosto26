@@ -16,11 +16,70 @@ The factory supports two communication patterns:
 2. **Event-Driven (Low Frequency)**: For sensor/control messages (TODO)
 
 Configuration:
-    The active middleware is determined by the `MIDDLEWARE_TYPE`
-    environment variable or configuration setting.
+    The active middleware is determined by `MIDDLEWARE_TYPE`, defined in
+    `utils/connection_conf.py` (MiddlewareConfig.type).
+
+Protobuf schema:
+    The single source of truth is `protos/imagen_pb2.py`. This module loads it
+    BEFORE importing any middleware interface and aliases the legacy path
+    `core.imagen_pb2` to the very same module object, so the descriptor
+    'imagen.proto' is registered exactly once in the protobuf descriptor pool
+    (no "duplicate file name imagen.proto" error).
 """
 
+import sys
+
 from utils.connection_conf import MIDDLEWARE_TYPE
+
+
+# =============================================================================
+#                       PROTOBUF: ESQUEMA UNICO (protos/imagen_pb2.py)
+# =============================================================================
+def _unify_protobuf_schema():
+    """
+    Garantiza que 'imagen.proto' se registre UNA sola vez en el descriptor pool.
+
+    1. Importa protos.imagen_pb2 (esquema canónico) antes que cualquier interfaz.
+    2. Si `core.imagen_pb2` aún no fue importado, lo registra en sys.modules como alias
+       del módulo canónico. Así, un `from core import imagen_pb2` posterior (por ejemplo
+       en interfaces/ecal_interface.py) reutiliza las mismas clases y NUNCA ejecuta un
+       core/imagen_pb2.py generado con protoc (que registraría un descriptor duplicado).
+    3. Si `core.imagen_pb2` ya estaba cargado, verifica que exponga las MISMAS clases.
+
+    Returns:
+        module: protos.imagen_pb2
+
+    Raises:
+        ImportError: si protos/imagen_pb2.py no existe o no se puede importar.
+        RuntimeError: si 'imagen.proto' ya fue registrado por otro módulo (duplicado real).
+    """
+    try:
+        from protos import imagen_pb2 as canonical
+    except ImportError as e:
+        raise ImportError(
+            "No se pudo importar protos.imagen_pb2. Verifica que exista protos/imagen_pb2.py "
+            "(regenerar: protoc --proto_path=protos --python_out=protos protos/imagen.proto)"
+        ) from e
+    except TypeError as e:   # "duplicate file name imagen.proto" / símbolo duplicado
+        raise RuntimeError(
+            "Descriptor 'imagen.proto' duplicado: otro módulo (¿un core/imagen_pb2.py generado "
+            "con protoc?) lo registró antes. Reemplaza core/imagen_pb2.py por el puente "
+            "'from protos.imagen_pb2 import *' y asegúrate de importar interfaces.middleware_factory primero."
+        ) from e
+
+    legacy = sys.modules.get("core.imagen_pb2")
+    if legacy is None:
+        sys.modules["core.imagen_pb2"] = canonical
+    elif getattr(legacy, "VideoFrame", None) is not canonical.VideoFrame:
+        raise RuntimeError(
+            "core.imagen_pb2 ya cargó un esquema distinto al de protos.imagen_pb2 "
+            "(descriptor 'imagen.proto' duplicado). Reemplaza core/imagen_pb2.py por el puente: "
+            "'from protos.imagen_pb2 import *'"
+        )
+    return canonical
+
+
+imagen_pb2 = _unify_protobuf_schema()
 
 # =============================================================================
 #                       STREAMING (CAMERAS) - HIGH FREQUENCY
