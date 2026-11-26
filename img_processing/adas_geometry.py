@@ -37,6 +37,8 @@ class Detection:
     lateral_m: float      # Desplazamiento lateral respecto al eje óptico (+ = derecha de la imagen)
     dist_m: float         # Distancia total al parachoques (z_m + offset)
     real_width_m: float   # Ancho físico asumido para la clase
+    # Contorno de la máscara de segmentación (px del frame original), None si no hay máscara
+    polygon: Optional[Tuple[Tuple[int, int], ...]] = None
 
 
 def strip_accents(text: str) -> str:
@@ -51,13 +53,15 @@ def scaled_focal_length(frame_width: int) -> float:
 
 
 def build_detection(x1: int, y1: int, x2: int, y2: int, cls_id: int, conf: float,
-                    coco_name: str, frame_width: int) -> Optional[Detection]:
+                    coco_name: str, frame_width: int,
+                    polygon: Optional[Tuple[Tuple[int, int], ...]] = None) -> Optional[Detection]:
     """
     Convierte una caja de YOLO en Detection con distancia en metros.
 
         Z = (ancho_real * FOCAL_LENGTH) / ancho_en_pixeles
         lateral = (centro_x - W/2) * Z / FOCAL_LENGTH
 
+    `polygon` (opcional) es el contorno de la máscara de segmentación en píxeles del frame.
     Retorna None si la clase no está en CLASS_REAL_WIDTHS o la caja es inválida.
     """
     real_w = cfg.CLASS_REAL_WIDTHS.get(cls_id)
@@ -77,6 +81,7 @@ def build_detection(x1: int, y1: int, x2: int, y2: int, cls_id: int, conf: float
         z_m=z_m, lateral_m=lateral_m,
         dist_m=z_m + cfg.ADAS_BUMPER_OFFSET_M,
         real_width_m=real_w,
+        polygon=polygon,
     )
 
 

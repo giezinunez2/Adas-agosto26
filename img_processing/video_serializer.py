@@ -2,8 +2,16 @@ import cv2
 import numpy as np
 import logging
 import time
-from typing import Optional
-from core import imagen_pb2
+from typing import List, Optional, Sequence
+
+from img_processing.adas_geometry import Detection
+
+# El esquema nuevo vive en protos/imagen_pb2.py. `core` queda solo como respaldo
+# (si core/imagen_pb2.py es un shim que reexporta protos, ambos son el mismo módulo).
+try:
+    from protos import imagen_pb2
+except ImportError:  # pragma: no cover
+    from core import imagen_pb2
 
 # Configure logging
 logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
@@ -35,7 +43,10 @@ except ImportError:
         RuntimeError: If compression/encoding fails
 """
 def frame_to_proto(frame: np.ndarray, frame_number: int, keyframe_interval: int,
-                   encoding: str, quality: int) -> imagen_pb2.VideoFrame:
+                   encoding: str, quality: int,
+                   detections: Optional[Sequence[Detection]] = None,
+                   inference_ms: float = 0.0, ai_fps: float = 0.0,
+                   metadata_only: bool = False) -> imagen_pb2.VideoFrame:
     height, width, channels = frame.shape
 
     # Create protobuf message
@@ -48,6 +59,18 @@ def frame_to_proto(frame: np.ndarray, frame_number: int, keyframe_interval: int,
     msg.encoding = getattr(imagen_pb2, encoding, imagen_pb2.JPEG)
     msg.compression_quality = quality
     msg.is_keyframe = (frame_number % keyframe_interval == 0)
+
+    # --- Edge AI: detecciones + telemetría de inferencia ---
+    msg.inference_ms = float(inference_ms)
+    msg.ai_fps = float(ai_fps)
+    if detections:
+        detections_to_proto(detections, msg)
+
+    # Modo solo metadatos: no se codifica ni se envía el video (frame_data vacío)
+    if metadata_only:
+        msg.is_metadata_only = True
+        msg.frame_data = b""
+        return msg
 
     # Apply encoding based on selected method
     if encoding == 'JPEG':
@@ -103,6 +126,10 @@ def frame_to_proto(frame: np.ndarray, frame_number: int, keyframe_interval: int,
 """
 def proto_to_frame(msg) -> Optional[np.ndarray]:
     try:
+        # Mensajes de solo metadatos (nodo Edge AI sin video): no hay frame que decodificar
+        if getattr(msg, 'is_metadata_only', False):
+            return None
+
         # Basic data verification
         if not msg.frame_data:
             logging.warning("Error: Frame data is empty")
@@ -261,3 +288,39 @@ def _verify_and_reshape_frame(frame, msg) -> Optional[np.ndarray]:
             return None
 
     return frame
+
+
+# ----------------------------------------------------------------------------
+# Detecciones <-> Protobuf (offloading Edge AI)
+# ----------------------------------------------------------------------------
+def detections_to_proto(detections: Sequence[Detection], msg) -> None:
+    """Agrega `detections` a msg.objects (incluye el polígono de segmentación)."""
+    for det in detections:
+        obj = msg.objects.add()
+        obj.x1, obj.y1, obj.x2, obj.y2 = int(det.x1), int(det.y1), int(det.x2), int(det.y2)
+        obj.cls_id = int(det.cls_id)
+        obj.label = det.label
+        obj.conf = float(det.conf)
+        obj.z_m = float(det.z_m)
+        obj.lateral_m = float(det.lateral_m)
+        obj.dist_m = float(det.dist_m)
+        obj.real_width_m = float(det.real_width_m)
+        if det.polygon:
+            for px, py in det.polygon:
+                pt = obj.polygon.add()
+                pt.x, pt.y = int(px), int(py)
+
+
+def proto_to_detections(msg) -> List[Detection]:
+    """Reconstruye List[Detection] desde msg.objects (ordenadas por distancia)."""
+    detections: List[Detection] = []
+    for obj in getattr(msg, 'objects', ()):
+        polygon = tuple((p.x, p.y) for p in obj.polygon) or None
+        detections.append(Detection(
+            x1=obj.x1, y1=obj.y1, x2=obj.x2, y2=obj.y2,
+            cls_id=obj.cls_id, label=obj.label, conf=obj.conf,
+            z_m=obj.z_m, lateral_m=obj.lateral_m, dist_m=obj.dist_m,
+            real_width_m=obj.real_width_m, polygon=polygon,
+        ))
+    detections.sort(key=lambda d: d.dist_m)
+    return detections

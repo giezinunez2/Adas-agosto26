@@ -5,3 +5,4 @@ __pycache__/
 *.engine
 .idea/
 .vscode/
+hailo_pkg/
