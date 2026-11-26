@@ -6,3 +6,5 @@ __pycache__/
 .idea/
 .vscode/
 hailo_pkg/
+models/*.pt
+models/*.hef
