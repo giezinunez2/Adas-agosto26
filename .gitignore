@@ -1,10 +1,17 @@
 venv/
 __pycache__/
+*.py[cod]
 *.pt
 *.onnx
 *.engine
+*.hef
 .idea/
 .vscode/
 hailo_pkg/
 models/*.pt
 models/*.hef
+models/*.onnx
+*.csv
+*.log
+runs/
+logs/
