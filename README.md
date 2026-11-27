@@ -2,6 +2,10 @@
 
 Sistema distribuido de percepción vehicular (ADAS) construido íntegramente sobre **tres Raspberry Pi con Ubuntu ARM64** conectadas en la subred `192.168.50.0/24`. Cada nodo periférico ejecuta segmentación semántica **YOLOv8n-seg** en el borde —con aceleración NPU **Hailo-8L** o CPU— y publica el resultado por **eCAL** usando **Protocol Buffers**. El nodo central solo recibe, fusiona y visualiza: nunca satura su CPU con video RGB crudo.
 
+> **Windows 10/11 (HMI nativo):** esta guía describe el clúster Ubuntu ARM64. Para trabajar
+> desde un PC Windows con `adas_dashboard.py` nativo (sin X11) y los nodos Edge por SSH +
+> Docker, consulta **[README_WINDOWS.md](README_WINDOWS.md)**.
+
 ---
 
 ## Índice

@@ -17,7 +17,21 @@ Key Features of eCAL:
 Note: eCAL requires proper network configuration for multicast communication.
 """
 
+import sys
 from typing import Callable
+
+# ---------------------------------------------------------------------------
+# Windows: eCAL 5.12 lee su configuración de %ECAL_DATA%/ecal.ini (y, si no
+# existe, de %ProgramData%/eCAL/ecal.ini). prepare_ecal_config() publica
+# ecal_windows.ini en un directorio de datos del usuario y exporta ECAL_DATA
+# ANTES de importar eCAL. En Linux/macOS no hace nada: los nodos Raspberry Pi
+# siguen usando ecal.ini (/etc/ecal/ecal.ini o el volumen del contenedor).
+# ---------------------------------------------------------------------------
+ECAL_CONFIG_PATH = None
+if sys.platform == "win32":
+    from utils.ecal_conf import prepare_ecal_config
+
+    ECAL_CONFIG_PATH = prepare_ecal_config()
 
 import ecal.core.core as ecal_core
 from ecal.core.publisher import ProtoPublisher

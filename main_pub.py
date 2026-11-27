@@ -39,12 +39,17 @@ from user_interface.adas_renderer import draw_detection_overlay
 from data_stream.pubs_stream_manager import StreamManagerPub
 from img_processing.adas_detector import AsyncADASDetector
 from utils.args_conf import parse_arguments
+from utils.helper_functions import normalize_camera_source
 from utils.pub_sub_conf import PUBLISHER_NAME, ADAS_MAX_DETECTION_AGE_S
 
 
 def main():
     # Parse command line arguments
     args = parse_arguments()
+
+    # Windows: la camara se abre SIEMPRE por indice numerico (0, 1, 2...) con
+    # cv2.CAP_DSHOW / cv2.CAP_MSMF; nunca con rutas POSIX tipo /dev/video0.
+    camera_source = normalize_camera_source(args.camera)
 
     # Create topic name
     topic_name = f"{args.topic_prefix}_{args.stream_id}"
@@ -68,7 +73,7 @@ def main():
     print("=" * 50)
     print(f"📡 Topic: {topic_name}")
     print(f"🆔 Stream ID: {args.stream_id}")
-    print(f"📷 Camera: {args.camera}")
+    print(f"📷 Camera: {camera_source}")
     print(f"🔧 Encoding: {args.encoding}")
     print(f"⭐ Quality: {args.quality}")
     print(f"📏 Resolution: {args.width}x{args.height}")
@@ -101,7 +106,7 @@ def main():
             detector.start()
 
         # Initialize camera with context manager for automatic cleanup
-        cam = CameraManager(args.camera,
+        cam = CameraManager(camera_source,
                             args.width,
                             args.height,
                             args.fps,

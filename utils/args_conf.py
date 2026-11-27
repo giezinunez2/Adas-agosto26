@@ -30,7 +30,16 @@ def fps_type(value: str | int) -> int:
     return validate_range(value, 1, 50, "Fps")
 
 def camera_type(value: str) -> int:
-    ivalue = int(value)
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Camera '{value}' is not a numeric index\n"
+            f"Use indices:  --camera 0, --camera 1 or --camera 2 "
+            f"(POSIX paths like /dev/video0 do not exist on Windows)"
+        ) from None
+    if ivalue < 0:
+        raise argparse.ArgumentTypeError(f"Camera index cannot be negative: {ivalue}")
     if not validate_camera(ivalue):
         raise argparse.ArgumentTypeError(f"Camera {ivalue} not available\n"
                                          f"Try with:  --camera 0, --camera 1 or --camera 2")

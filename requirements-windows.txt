@@ -1,0 +1,26 @@
+# ============================================================================
+# ADAS Cluster — dependencias del HMI NATIVO en Windows 10/11
+# Python 3.10 - 3.12, 64 bits. Instalación:
+#
+#   py -3 -m venv .venv
+#   .venv\Scripts\python -m pip install -r requirements-windows.txt
+#
+# eCAL 5.12 NO se instala con pip desde este archivo:
+#   1) instala el .msi oficial de eCAL 5.12
+#   2) instala el wheel del binding:  pip install ecal5-<ver>-<py>-win_amd64.whl
+# Ver README_WINDOWS.md, paso 4.
+# ============================================================================
+
+# Ruedas CPU de PyTorch (evita descargar ~2.5 GB de CUDA si no hay GPU NVIDIA)
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+numpy>=1.26,<3
+opencv-python>=4.8
+protobuf==3.20.0
+lz4>=4.3
+ultralytics>=8.3
+torch>=2.2
+torchvision>=0.17
+
+# Solo necesario si se usa el middleware RabbitMQ (connection_conf.py)
+pika>=1.3

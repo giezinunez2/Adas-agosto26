@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from utils.helper_functions import get_optimal_backend
+from utils.helper_functions import open_video_capture
 from user_interface.text_labels_overlay import draw_overlay
 # NOTA: YOLOProcessor se importa de forma DIFERIDA en CameraManager.__init__ (solo si enable_yolo=True).
 # Un import a nivel de módulo rompería main_pub.py en la imagen ligera adas:pi5 (sin PyTorch/ultralytics),
@@ -82,15 +82,18 @@ class CameraManager:
         ValueError: If the properties cannot be configured
     
     Note:
-        Use get_optimal_backend() to select the most efficient backend
-        based on the operating system
+        open_video_capture() elige el backend segun el SO (CAP_DSHOW y, si falla,
+        CAP_MSMF en Windows; CAP_V4L2 en Linux) y abre la camara por indice numerico.
     """
     def __enter__(self):
-        backend = get_optimal_backend()
-        self.cap = cv2.VideoCapture(self.camera_index, backend)
+        # Windows: indice numerico (0, 1, 2...), nunca rutas POSIX tipo /dev/video0.
+        self.cap = open_video_capture(self.camera_index)
 
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Error: Could not open camera {self.camera_index}")
+        if self.cap is None:
+            raise RuntimeError(
+                f"Error: Could not open camera {self.camera_index} "
+                f"(en Windows usa un indice 0, 1, 2... con la camara conectada)"
+            )
 
         # Configure camera properties
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)

@@ -31,6 +31,16 @@ import sys
 
 from utils.connection_conf import MIDDLEWARE_TYPE
 
+# =============================================================================
+#      WINDOWS: ecal_windows.ini -> ECAL_DATA (antes de que se importe eCAL)
+# =============================================================================
+# En Linux/macOS no se ejecuta nada: la configuración de los nodos Raspberry Pi
+# (ecal.ini montado en /app/ecal.ini y /etc/ecal/ecal.ini) queda intacta.
+if sys.platform == "win32":
+    from utils.ecal_conf import prepare_ecal_config
+
+    prepare_ecal_config()
+
 
 # =============================================================================
 #                       PROTOBUF: ESQUEMA UNICO (protos/imagen_pb2.py)

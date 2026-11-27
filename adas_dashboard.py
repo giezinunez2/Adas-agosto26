@@ -4,15 +4,21 @@
 adas_dashboard.py — Panel de Control y Orquestador (HMI Central) del clúster ADAS
 =================================================================================
 
-Aplicación de escritorio Tkinter (tema oscuro) para Ubuntu ARM64 / Raspberry Pi que
-orquesta los contenedores Docker del clúster de percepción vehicular (eCAL + Protobuf)
-desde el Nodo Central (192.168.50.63).
+Aplicación de escritorio Tkinter (tema oscuro) que orquesta el clúster de percepción
+vehicular (eCAL + Protobuf). El MISMO código funciona en dos escenarios:
+
+  * Ubuntu ARM64 / Raspberry Pi (Nodo Central 192.168.50.63): el HMI corre dentro de
+    un contenedor Docker con acceso X11 (`docker run ... --network host`).
+  * Windows 10/11 (cualquier PC del equipo): el HMI corre de forma NATIVA
+    (Tkinter + OpenCV en pantalla, sin X11 ni DISPLAY) y solo los nodos Edge se
+    orquestan por SSH + Docker en las Raspberry Pi.
 
 Nodos gestionados
 -----------------
   * ADASCore   core@192.168.50.61  (Raspberry Pi 5 + Hailo-8L)  imagen adas:pi5
   * zorros-desk zorro@192.168.50.32 (nodo auxiliar CPU)          imagen adas:edge-cpu
-  * HMI local  (esta máquina)                                   imagen adas:edge-cpu
+  * HMI local  (esta máquina)      Linux: contenedor adas:edge-cpu + X11
+                                  Windows: proceso nativo (sys.executable)
 
 Características
 ---------------
@@ -29,13 +35,18 @@ con la GUI únicamente mediante queue.Queue: la ventana nunca se bloquea.
 
 Requisitos
 ----------
-  sudo apt install -y python3-tk
-  SSH sin contraseña:  ssh-copy-id core@192.168.50.61 ; ssh-copy-id zorro@192.168.50.32
-  Docker accesible sin sudo para el usuario que ejecuta la app.
+  Linux (Nodo Central):
+    sudo apt install -y python3-tk
+    SSH sin contraseña:  ssh-copy-id core@192.168.50.61 ; ssh-copy-id zorro@192.168.50.32
+    Docker accesible sin sudo para el usuario que ejecuta la app.
+  Windows 10/11 (HMI nativo, ver README_WINDOWS.md):
+    py -3 -m venv .venv ; .venv\Scripts\pip install -r requirements-windows.txt
+    eCAL 5.12 (.msi + wheel ecal5), cliente OpenSSH y llaves en %USERPROFILE%\.ssh
 
 Uso
 ---
-  python3 adas_dashboard.py
+  Linux:    python3 adas_dashboard.py
+  Windows:  .\iniciar_windows.ps1   (o  .venv\Scripts\python adas_dashboard.py)
 """
 
 from __future__ import annotations
@@ -43,16 +54,20 @@ from __future__ import annotations
 import csv
 import getpass
 import os
+import platform
 import queue
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -71,9 +86,15 @@ except ImportError as exc:  # pragma: no cover - depende del sistema
 
 APP_TITLE = "ADAS Cluster HMI — Panel de Control"
 PROJECT_DIR = "Adas-agosto26"
-# En el HMI los volúmenes se montan desde el directorio real del proyecto (en la Pi
-# coincide con ~/Adas-agosto26); en los nodos remotos se usa $HOME/Adas-agosto26.
-LOCAL_PROJECT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+# Directorio real del proyecto resuelto dinámicamente con pathlib: funciona en cualquier
+# disco o carpeta (C:\..., D:\..., E:\...) sin rutas absolutas ni usuarios fijos.
+# En el HMI Linux coincide con ~/Adas-agosto26; en los nodos remotos se usa $HOME/Adas-agosto26.
+PROJECT_ROOT = Path(__file__).resolve().parent
+LOCAL_PROJECT_DIR = str(PROJECT_ROOT)
+
+# Windows: HMI nativo (Tkinter/OpenCV en pantalla, sin X11) + nodos Edge por SSH/Docker.
+IS_WINDOWS = os.name == "nt" or platform.system() == "Windows"
 
 STATUS_INTERVAL = 5.0   # s entre comprobaciones de nodo
 STATS_INTERVAL = 3.0    # s entre muestreos de docker stats
@@ -92,8 +113,8 @@ BLUE = "#79c0ff"
 ACCENT = "#4da3ff"
 CONSOLE_BG = "#090c10"
 
-FONT = "DejaVu Sans"
-MONO = "DejaVu Sans Mono"
+FONT = "Segoe UI" if os.name == "nt" else "DejaVu Sans"
+MONO = "Consolas" if os.name == "nt" else "DejaVu Sans Mono"
 
 SSH_OPTS = [
     "-o", "BatchMode=yes",
@@ -129,7 +150,8 @@ DEFAULT_NODES = {
     },
     "hmi": {
         "label": "Nodo Central (HMI)",
-        "user": os.environ.get("USER") or getpass.getuser(),
+        "user": (os.environ.get("USER") or os.environ.get("USERNAME")
+                 or getpass.getuser()),
         "ip": "192.168.50.63",
         "local": True,
         "requires": (),
@@ -194,7 +216,12 @@ STATS_SCRIPT = "docker stats --no-stream --format " + shlex.quote(STATS_FORMAT) 
 
 
 def command_argv(node: Node, script: str, exec_local: bool = False) -> list:
-    """argv para ejecutar un script bash en el nodo (local o vía SSH)."""
+    """argv para ejecutar un script bash en el nodo (local o vía SSH).
+
+    En Windows NUNCA se invoca bash: el nodo local se maneja con procesos nativos
+    (`_start_native`) y los nodos Edge con el cliente ssh de OpenSSH para Windows,
+    que ejecuta el script en el bash de la Raspberry Pi.
+    """
     if node.local:
         return ["bash", "-lc", ("exec " + script) if exec_local else script]
     return ["ssh", *SSH_OPTS, node.target, script]
@@ -206,18 +233,33 @@ def run_remote(node: Node, script: str, timeout: float = 20.0) -> tuple:
         proc = subprocess.run(
             command_argv(node, script),
             capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
         )
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
     except subprocess.TimeoutExpired:
         return 124, f"timeout tras {timeout:.0f}s en {node.address}"
     except FileNotFoundError:
-        return 127, "ssh/bash no disponible en el HMI"
+        return 127, ("ssh no disponible en este equipo (Windows: activa el cliente "
+                     "OpenSSH; Linux: apt install openssh-client)")
     except Exception as exc:  # pragma: no cover - defensivo
         return 1, f"{exc}"
 
 
+def kill_process_tree(pid: int) -> None:
+    """Termina el árbol de procesos en Windows (taskkill /T cierra también sus hijos)."""
+    if not IS_WINDOWS:
+        return
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
 def check_node(node: Node) -> dict:
     """Comprueba conectividad y presencia de dispositivos/docker en un nodo."""
+    if node.local and IS_WINDOWS:
+        return check_local_windows()
     state = {
         "reachable": False,
         "hailo0": False,
@@ -240,12 +282,70 @@ def check_node(node: Node) -> dict:
     return state
 
 
+_CAMERA_PROBE_TTL = 20.0
+_camera_probe = {"index": None, "ok": False, "stamp": 0.0}
+
+
+def local_camera_available(index: int = 0, ttl: float = _CAMERA_PROBE_TTL) -> bool:
+    """Comprueba con OpenCV que exista una cámara local por índice (Windows).
+
+    En Windows no hay /dev/video*: la cámara se valida abriéndola por índice con
+    CAP_DSHOW / CAP_MSMF. El resultado se cachea `ttl` segundos y, si la cámara está
+    ocupada por un publicador local, se conserva el último estado bueno en lugar de
+    marcarla en rojo.
+    """
+    now = time.monotonic()
+    cached = _camera_probe["index"] == index
+    if cached and (now - _camera_probe["stamp"]) < ttl:
+        return bool(_camera_probe["ok"])
+
+    ok = False
+    try:
+        from utils.helper_functions import open_video_capture   # import diferido (cv2)
+        cap = open_video_capture(index)
+        if cap is not None:
+            try:
+                ret, frame = cap.read()
+                ok = bool(ret) and frame is not None
+            finally:
+                cap.release()
+    except Exception:  # noqa: BLE001 - una cámara ausente no debe romper el monitor
+        ok = False
+
+    if not ok and cached and _camera_probe["ok"] and (now - _camera_probe["stamp"]) < 120:
+        return True      # cámara en uso por un publicador local: se mantiene el estado
+
+    _camera_probe.update(index=index, ok=ok, stamp=now)
+    return ok
+
+
+def check_local_windows() -> dict:
+    """Salud del nodo local en Windows: Python, cámara OpenCV y ssh nativo.
+
+    Se omiten /dev/video0, /dev/hailo0 y `xhost` (no existen en Windows) y no se exige
+    docker local: el HMI corre como proceso nativo y los contenedores viven en las
+    Raspberry Pi, gobernados por ssh.
+    """
+    return {
+        "reachable": True,
+        "hailo0": False,
+        "video0": local_camera_available(0),
+        "video2": False,
+        "docker": False,          # sin Docker local por diseño en Windows
+        "daemon": False,
+        "python": bool(sys.version_info >= (3, 10)),
+        "ssh": shutil.which("ssh") is not None,
+    }
+
+
 def probe_devices(node: Node) -> Optional[set]:
     """Conjunto de /dev/video* y /dev/hailo* presentes en el nodo.
 
     Devuelve None si el nodo no responde: en ese caso no se filtra ningún job,
     para no ocultar el error real de docker/SSH.
     """
+    if node.local and IS_WINDOWS:
+        return None      # en Windows no hay /dev/video*: la cámara se valida con OpenCV
     rc, out = run_remote(node, DEVICES_SCRIPT, 8.0)
     if rc != 0:
         return None
@@ -254,6 +354,8 @@ def probe_devices(node: Node) -> Optional[set]:
 
 def fetch_stats(node: Node) -> Optional[list]:
     """Devuelve filas (nodo, contenedor, cpu, cpu_txt, mem, mem_pct) o None si el nodo no responde."""
+    if node.local and IS_WINDOWS:
+        return []        # el HMI nativo de Windows no ejecuta contenedores adas_*
     rc, out = run_remote(node, STATS_SCRIPT, 14.0)
     if rc != 0:
         return None
@@ -305,12 +407,14 @@ def build_docker_run(spec: ContainerSpec, node: Node, nodes: tuple, display: str
         parts += ["--device", shlex.quote(device)]
 
     if node.local:
+        # as_posix(): un volumen docker siempre usa '/', también si el repo está en Windows.
+        local_dir = PROJECT_ROOT.as_posix()
         parts += [
-            "-v", shlex.quote(f"{LOCAL_PROJECT_DIR}/ecal.ini:/app/ecal.ini:ro"),
-            "-v", shlex.quote(f"{LOCAL_PROJECT_DIR}/ecal.ini:/etc/ecal/ecal.ini:ro"),
+            "-v", shlex.quote(f"{local_dir}/ecal.ini:/app/ecal.ini:ro"),
+            "-v", shlex.quote(f"{local_dir}/ecal.ini:/etc/ecal/ecal.ini:ro"),
         ]
         if spec.models:
-            parts += ["-v", shlex.quote(f"{LOCAL_PROJECT_DIR}/models:/app/models:ro")]
+            parts += ["-v", shlex.quote(f"{local_dir}/models:/app/models:ro")]
     else:
         # En remoto el comando lo vuelve a interpretar el shell del nodo (ssh ...
         # "docker run ..."), así que $HOME debe ir SIN comillas dentro del token:
@@ -529,6 +633,9 @@ class Dashboard:
 
         self._log("sys", "ADAS Cluster HMI iniciado · Nodo Central %s" % DEFAULT_NODES["hmi"]["ip"])
         self._log("info", "SSH en modo BatchMode (llaves sin contraseña) · docker sin sudo requerido")
+        if IS_WINDOWS:
+            self._log("info", "Windows: HMI nativo (sin X11/DISPLAY) · nodos Edge por ssh+Docker · "
+                              "eCAL usa ecal_windows.ini vía ECAL_DATA")
         self._log("info", "Monitor de nodos cada 5 s · telemetría docker stats cada 3 s")
 
     # ──────────────────────────────────────────────────────────────────────
@@ -609,9 +716,14 @@ class Dashboard:
         title.pack(side="left")
         tk.Label(title, text="ADAS CLUSTER · HMI", bg=BG, fg=FG,
                  font=(FONT, 17, "bold")).pack(anchor="w")
+        if IS_WINDOWS:
+            subtitle = ("Orquestador SSH + Docker en los nodos Edge · HMI nativo Windows "
+                        "(Tkinter/OpenCV) · eCAL + Protobuf · subred 192.168.50.0/24")
+        else:
+            subtitle = ("Orquestador Docker + eCAL + Protobuf · Nodo Central 192.168.50.63 · "
+                        "subred 192.168.50.0/24")
         tk.Label(
-            title,
-            text="Orquestador Docker + eCAL + Protobuf · Nodo Central 192.168.50.63 · subred 192.168.50.0/24",
+            title, text=subtitle,
             bg=BG, fg=MUTED, font=(FONT, 8),
         ).pack(anchor="w", pady=(2, 0))
 
@@ -650,9 +762,13 @@ class Dashboard:
 
             chips_row = tk.Frame(card, bg=PANEL)
             chips_row.pack(fill="x")
-            chip_defs = [("ssh", "LOCAL" if defaults["local"] else "SSH")]
-            chip_defs += [(dev, dev) for dev in defaults["requires"]]
-            chip_defs.append(("docker", "docker"))
+            if defaults["local"] and IS_WINDOWS:
+                # HMI nativo: sin /dev/* ni Docker local; se valida python, cámara y ssh.
+                chip_defs = [("ssh", "ssh"), ("video0", "cam0"), ("python", "python")]
+            else:
+                chip_defs = [("ssh", "LOCAL" if defaults["local"] else "SSH")]
+                chip_defs += [(dev, dev) for dev in defaults["requires"]]
+                chip_defs.append(("docker", "docker"))
 
             chip_labels = {}
             for chip_key, chip_text in chip_defs:
@@ -1094,12 +1210,16 @@ class Dashboard:
 
         reachable = bool(state.get("reachable"))
         devices_ok = all(state.get(dev) for dev in node.requires)
-        healthy = reachable and devices_ok and state.get("docker") and state.get("daemon", True)
+        if node.local and IS_WINDOWS:
+            # Sin docker local: la salud depende de Python y de la cámara local.
+            healthy = reachable and bool(state.get("python")) and devices_ok
+        else:
+            healthy = reachable and devices_ok and state.get("docker") and state.get("daemon", True)
         card["dot"].configure(fg=GREEN if healthy else RED)
 
         for chip_key, (label, text) in card["chips"].items():
             if chip_key == "ssh":
-                ok = reachable
+                ok = reachable and state.get("ssh", True)
                 unknown = False
             elif chip_key == "docker":
                 ok = reachable and state.get("docker") and state.get("daemon", True)
@@ -1162,9 +1282,12 @@ class Dashboard:
                              name="adas-stop", daemon=True).start()
             return
 
-        display = os.environ.get("DISPLAY") or ":0"
-        if not os.environ.get("DISPLAY"):
-            self._log("warn", "DISPLAY no definido en el entorno; se usará :0 para el contenedor central")
+        if IS_WINDOWS:
+            display = ""          # HMI nativo: sin X11 ni DISPLAY
+        else:
+            display = os.environ.get("DISPLAY") or ":0"
+            if not os.environ.get("DISPLAY"):
+                self._log("warn", "DISPLAY no definido en el entorno; se usará :0 para el contenedor central")
         threading.Thread(target=self._launch_worker, args=(mode, nodes, display),
                          name=f"adas-{mode['key']}", daemon=True).start()
 
@@ -1186,12 +1309,14 @@ class Dashboard:
 
             by_key = {node.key: node for node in nodes}
             hmi = by_key.get("hmi")
-            if any(spec.gui for _, spec in mode["jobs"]) and hmi is not None:
+            if (not IS_WINDOWS) and any(spec.gui for _, spec in mode["jobs"]) and hmi is not None:
                 rc, out = run_remote(hmi, XHOST_SCRIPT, 10)
                 if rc == 0:
                     self._log("info", "X11: acceso del contenedor al servidor gráfico habilitado (xhost +local:docker)")
                 else:
                     self._log("warn", f"X11: no se pudo ejecutar xhost (rc={rc}) {out.strip()[:160]}")
+            elif IS_WINDOWS:
+                self._log("info", "Windows: el HMI se lanza nativo (sin xhost ni DISPLAY)")
 
             started = []
             device_cache: dict = {}
@@ -1202,6 +1327,8 @@ class Dashboard:
                 if not spec.detached:
                     continue
                 node = by_key[node_key]
+                if node.local and IS_WINDOWS:
+                    continue      # el nodo local de Windows no usa Docker (se lanza nativo)
                 missing = self._missing_devices(node, spec, device_cache)
                 if missing:
                     self._log("warn", f"{node.label}: se omite {spec.name} — no existe "
@@ -1235,9 +1362,14 @@ class Dashboard:
             for node_key, spec in mode["jobs"]:
                 if self._closing:
                     return
+                node = by_key[node_key]
+                if node.local and IS_WINDOWS:
+                    # main_sub_ai.py / main_pub.py con sys.executable: sin Docker ni X11.
+                    self._start_native(spec)
+                    time.sleep(0.8)
+                    continue
                 if spec.detached:
                     continue
-                node = by_key[node_key]
                 self._start_attached(node, spec, nodes, display)
                 time.sleep(0.8)
 
@@ -1331,6 +1463,67 @@ class Dashboard:
                               f"Comando sugerido en el nodo: docker run sin -d para ver el error"
                               f" o docker ps -a --filter name={spec.name}")
 
+    def _native_argv(self, spec: ContainerSpec) -> list:
+        """argv nativo para Windows: sys.executable + los args del job (sin 'python3').
+
+        Las rutas de modelo se resuelven contra la raíz del proyecto (que es el cwd del
+        subproceso): `--model models/yolov8n-seg.pt` se sustituye por `yolov8n-seg.pt`
+        solo cuando el archivo no existe pero el modelo sí está en la raíz.
+        """
+        args = list(spec.args)
+        if args and args[0] in ("python", "python3", "py"):
+            args = args[1:]
+        for index, value in enumerate(args[:-1]):
+            if value != "--model":
+                continue
+            candidate = PROJECT_ROOT / args[index + 1]
+            fallback = PROJECT_ROOT / Path(args[index + 1]).name
+            if not candidate.exists() and fallback.exists():
+                args[index + 1] = Path(args[index + 1]).name
+        return [sys.executable, *args]
+
+    def _start_native(self, spec: ContainerSpec) -> None:
+        """Lanza main_sub_ai.py / main_pub.py como proceso nativo de Windows.
+
+        Sin `docker run`, sin `xhost` y sin DISPLAY: Tkinter y OpenCV dibujan
+        directamente en la pantalla del PC. La salida se refleja en la consola del HMI.
+        """
+        argv = self._native_argv(spec)
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        # UTF-8 en las tuberías de log (los main_*.py imprimen emojis).
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
+        self._log("cmd", f"HMI local (Windows) → {' '.join(argv[1:])}")
+        try:
+            process = subprocess.Popen(
+                argv, cwd=str(PROJECT_ROOT), env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+        except Exception as exc:
+            self._log("err", f"Nodo local: no se pudo iniciar {spec.name}: {exc}")
+            return
+
+        with self._proc_lock:
+            self._procs.append(process)
+        self._log("ok", f"Nodo local: {spec.name} iniciado como proceso nativo (PID {process.pid})")
+        threading.Thread(target=self._stream_process, args=(process, spec.name),
+                         name=f"log-{spec.name}", daemon=True).start()
+        threading.Thread(target=self._verify_native, args=(process, spec.name),
+                         name=f"check-{spec.name}", daemon=True).start()
+
+    def _verify_native(self, process: subprocess.Popen, name: str) -> None:
+        """Avisa en la consola si el proceso nativo murió al arrancar (import/modelo/cámara)."""
+        time.sleep(2.0)
+        code = process.poll()
+        if code is None:
+            self._log("ok", f"Nodo local: {name} en ejecución")
+        else:
+            self._log("err", f"Nodo local: {name} terminó al instante (código {code}); "
+                              f"revisa la consola (dependencias, modelo o cámara)")
+
     def _start_attached(self, node: Node, spec: ContainerSpec, nodes: tuple, display: str) -> None:
         command = build_docker_run(spec, node, nodes, display)
         self._log("cmd", f"{node.label} → docker run --rm --name {spec.name} "
@@ -1339,7 +1532,7 @@ class Dashboard:
             process = subprocess.Popen(
                 command_argv(node, command, exec_local=True),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
             )
         except Exception as exc:
             self._log("err", f"{node.label}: no se pudo iniciar {spec.name}: {exc}")
@@ -1357,7 +1550,7 @@ class Dashboard:
             process = subprocess.Popen(
                 command_argv(node, script),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
             )
         except Exception as exc:
             self._log("warn", f"{node.label}: no se pudo seguir el log de {container}: {exc}")
@@ -1413,6 +1606,8 @@ class Dashboard:
             try:
                 process.wait(timeout=2)
             except Exception:
+                if IS_WINDOWS:
+                    kill_process_tree(process.pid)
                 try:
                     process.kill()
                 except Exception:
@@ -1420,9 +1615,17 @@ class Dashboard:
 
     def _cleanup(self, nodes: tuple, reason: str) -> None:
         self._log("sys", f"🧹 Limpieza de contenedores adas_* · {reason}")
+        targets = nodes
+        if IS_WINDOWS:
+            # El nodo local de Windows no tiene Docker: se cierran sus procesos nativos.
+            self._terminate_processes()
+            targets = tuple(node for node in nodes if not node.local)
+            self._log("ok", "Nodo local (Windows): procesos nativos finalizados (terminate/taskkill)")
+        if not targets:
+            return
         try:
-            with ThreadPoolExecutor(max_workers=len(nodes)) as pool:
-                futures = {pool.submit(run_remote, node, CLEAN_SCRIPT, 20.0): node for node in nodes}
+            with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+                futures = {pool.submit(run_remote, node, CLEAN_SCRIPT, 20.0): node for node in targets}
                 for future in as_completed(futures):
                     node = futures[future]
                     try:
@@ -1527,7 +1730,10 @@ class Dashboard:
         ))
         tk.Label(overlay, text="Deteniendo el clúster…", bg=PANEL, fg=FG,
                  font=(FONT, 12, "bold")).pack(pady=(26, 4))
-        tk.Label(overlay, text="docker rm -f adas_* en ADASCore, zorros-desk y HMI",
+        tk.Label(overlay,
+                 text=("docker rm -f adas_* por SSH + procesos nativos de Windows"
+                       if IS_WINDOWS else
+                       "docker rm -f adas_* en ADASCore, zorros-desk y HMI"),
                  bg=PANEL, fg=MUTED, font=(FONT, 8)).pack()
         progress = ttk.Progressbar(overlay, mode="indeterminate", length=320,
                                    style="Adas.Horizontal.TProgressbar")
@@ -1573,6 +1779,12 @@ def main() -> None:
     try:
         root = tk.Tk()
     except tk.TclError as exc:
+        if IS_WINDOWS:
+            raise SystemExit(
+                "No se pudo abrir la ventana Tk en Windows: {}\n"
+                "Comprueba que tu Python incluye Tkinter (python -m tkinter) y vuelve a "
+                "ejecutar iniciar_windows.ps1.".format(exc)
+            )
         raise SystemExit(
             "No se pudo abrir la ventana Tk (¿falta DISPLAY / servidor X11?): {}\n"
             "Ejecute el panel dentro de la sesión gráfica de Ubuntu (DISPLAY=:0).".format(exc)

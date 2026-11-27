@@ -1,6 +1,13 @@
 venv/
+.venv/
+env/
+ENV/
 __pycache__/
 *.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 *.pt
 *.onnx
 *.engine
@@ -15,3 +22,5 @@ models/*.onnx
 *.log
 runs/
 logs/
+# Copia local de la configuración eCAL en Windows (si se usa ECAL_DATA en el repo)
+.ecal_runtime/
